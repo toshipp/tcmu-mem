@@ -5,3 +5,4 @@ authors = ["toshi_pp <toshiq2@gmail.com>"]
 
 [dependencies]
 libc = "*"
+byteorder = "*"

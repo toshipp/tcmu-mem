@@ -1,6 +1,8 @@
 extern crate libc;
+extern crate byteorder;
+use byteorder::{ByteOrder, BigEndian};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Write, Result};
 use std::os::unix::io::AsRawFd;
 use std::ptr;
 use std::mem::transmute;
@@ -94,7 +96,8 @@ impl<'a> Responder<'a> {
         }
     }
 
-    fn write(&mut self, mut buf: &[u8]) {
+    fn write(&mut self, mut buf: &[u8]) -> Result<usize> {
+        let len = buf.len();
         while buf.len() > 0 && self.i < self.iov.len() {
             let out = unsafe {
                 slice::from_raw_parts_mut(
@@ -114,6 +117,7 @@ impl<'a> Responder<'a> {
             &mut out[..l].copy_from_slice(&buf[..l]);
             buf = &buf[l..];
         }
+        Ok(len - buf.len())
     }
 }
 
@@ -132,7 +136,7 @@ fn handle_inquiry_std(ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) {
     for (s, d) in "0001".bytes().zip(&mut buf[32..]) {
         *d = s;
     }
-    Responder::new(ent, base).write(&buf);
+    let _ = Responder::new(ent, base).write(&buf);
 }
 
 unsafe fn into_cdb6<'a>(p: *const u8) -> &'a [u8] {
@@ -190,21 +194,17 @@ fn handle_mode_sense_6(cdb_p: *mut u8, ent: &mut tcmu::tcmu_cmd_entry) -> u8 {
 }
 
 const DEVICE_SIZE: usize = 1 * 1024 * 1024 * 1024;
-const BLOCK_SIZE: usize = 4 * 1024;
-
-fn htobe32(x: u32) -> u32 {
-    unimplemented!()
-}
+// In sd.c, 512, 1024, 2048, 4096 are only supported.
+const BLOCK_SIZE: usize = 4096;
 
 fn handle_read_capacity_10(ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) -> u8 {
-    let lba = htobe32((DEVICE_SIZE / BLOCK_SIZE) as u32);
-    let block_size = htobe32(BLOCK_SIZE as u32);
-    Responder::new(ent, base).write(unsafe {
-        slice::from_raw_parts(transmute::<_, *const u8>(&lba), 4)
-    });
-    Responder::new(ent, base).write(unsafe {
-        slice::from_raw_parts(transmute::<_, *const u8>(&block_size), 4)
-    });
+    let mut lba = [0; 4];
+    BigEndian::write_u32(&mut lba, (DEVICE_SIZE / BLOCK_SIZE) as u32);
+    let mut block_size = [0; 4];
+    BigEndian::write_u32(&mut block_size, BLOCK_SIZE as u32);
+    let mut r = Responder::new(ent, base);
+    let _ = r.write(&lba);
+    let _ = r.write(&block_size);
 
     NO_SENSE
 }
@@ -213,8 +213,8 @@ const INQUIRY: u8 = 0x12;
 const TEST_UNIT_READY: u8 = 0x00;
 const MODE_SENSE_6: u8 = 0x1a;
 const READ_CAPACITY_10: u8 = 0x25;
-const GET_LBA_SATUS: u8 = 0x9e;
-const REPORT_SUPPORTED_OPERATIONS_CODES: u8 = 0xa3;
+// const GET_LBA_SATUS: u8 = 0x9e;
+// const REPORT_SUPPORTED_OPERATIONS_CODES: u8 = 0xa3;
 
 fn do_cmd(p: *mut u8) {
     let mb: &mut tcmu::tcmu_mailbox =
