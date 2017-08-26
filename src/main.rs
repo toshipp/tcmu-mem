@@ -97,7 +97,7 @@ impl<'a> Responder<'a> {
     }
 
     fn write(&mut self, mut buf: &[u8]) -> Result<usize> {
-        let len = buf.len();
+        let mut n = 0;
         while buf.len() > 0 && self.i < self.iov.len() {
             let out = unsafe {
                 slice::from_raw_parts_mut(
@@ -116,8 +116,9 @@ impl<'a> Responder<'a> {
             };
             &mut out[..l].copy_from_slice(&buf[..l]);
             buf = &buf[l..];
+            n += l;
         }
-        Ok(len - buf.len())
+        Ok(n)
     }
 }
 
@@ -233,7 +234,13 @@ fn do_cmd(p: *mut u8) {
     while ent_p != unsafe { p.offset((mb.cmdr_off + mb.cmd_head) as isize) } {
         let ent = unsafe { (ent_p as *mut tcmu::tcmu_cmd_entry).as_mut().unwrap() };
         let op = tcmu::tcmu_hdr_get_op(ent.hdr.len_op);
-        print!("op: {} id: {}\n", op, ent.hdr.cmd_id);
+        print!(
+            "op: {} id: {} k: {} u: {}\n",
+            op,
+            ent.hdr.cmd_id,
+            ent.hdr.kflags,
+            ent.hdr.uflags
+        );
         if op == tcmu::tcmu_opcode::TCMU_OP_CMD as u32 {
             unsafe {
                 let cdb_p = p.offset(ent.__bindgen_anon_1.req.as_ref().cdb_off as isize);
