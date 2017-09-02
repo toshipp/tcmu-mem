@@ -170,7 +170,15 @@ fn handle_test_unit_ready() -> u8 {
     NO_SENSE
 }
 
-fn handle_mode_sense_6(cdb_p: *mut u8, ent: &mut tcmu::tcmu_cmd_entry) -> u8 {
+#[repr(C, packed)]
+struct mode_parameter_header {
+    mode_data_length: u8,
+    medium_type: u8,
+    wp_dpofua: u8,
+    block_description_length: u8,
+}
+
+fn handle_mode_sense_6(cdb_p: *mut u8, ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) -> u8 {
     let cdb = unsafe { into_cdb6(cdb_p) };
     let dbd = cdb[1] & (1 << 3) > 0;
     let pc = cdb[2] >> 6;
@@ -186,12 +194,44 @@ fn handle_mode_sense_6(cdb_p: *mut u8, ent: &mut tcmu::tcmu_cmd_entry) -> u8 {
         subpage_code
     );
 
-    // if not supported, illegal request and invalid field in cdb.
+    match (page_code, subpage_code) {
+        (0x0, _) => {
+            // vender specific.
+            let header = mode_parameter_header {
+                mode_data_length: 3,
+                medium_type: 0,
+                wp_dpofua: 1 << 4, //dpofua is 1, wp is 0
+                block_description_length: 0,
+            };
+            let mut r = Responder::new(ent, base);
+            r.write(unsafe { transmute::<_, &[u8; 4]>(&header) })
+                .unwrap();
+            NO_SENSE
+        }
+        (0x3f, _) /* all pages */| ( 0x8, _) /* caching */=> {
+            let header = mode_parameter_header {
+                mode_data_length: 3 + 20,
+                medium_type: 0,
+                wp_dpofua: 1 << 4, //dpofua is 1, wp is 0
+                block_description_length: 0,
+            };
+            let mut r = Responder::new(ent, base);
+            r.write(unsafe { transmute::<_, &[u8; 4]>(&header) })
+                .unwrap();
+            let mut cache_page = [0u8; 20];
+            cache_page[0] = 0x8;
+            cache_page[1] = 0x12;
+            cache_page[2] = 1 << 2; //WCE, RCD
+            r.write(&cache_page).unwrap();
+            NO_SENSE
+        }
 
+        _ => {
+            not_handled(ent);
+            CHECK_CONDITION
+        }
+    }
 
-    //NO_SENSE
-    not_handled(ent);
-    CHECK_CONDITION
 }
 
 const DEVICE_SIZE: usize = 1 * 1024 * 1024 * 1024;
@@ -210,12 +250,28 @@ fn handle_read_capacity_10(ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) -> u8 
     NO_SENSE
 }
 
+fn handle_report(cdb_p: *mut u8, ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) -> u8 {
+    let cdb = unsafe { into_cdb6(cdb_p) };
+    let service_action = cdb[1] & 0x1f;
+    match service_action {
+        0xc => {
+            // report supported operation codes
+            not_handled(ent);
+            CHECK_CONDITION
+        }
+        _ => {
+            not_handled(ent);
+            CHECK_CONDITION
+        }
+    }
+}
+
 const INQUIRY: u8 = 0x12;
 const TEST_UNIT_READY: u8 = 0x00;
 const MODE_SENSE_6: u8 = 0x1a;
 const READ_CAPACITY_10: u8 = 0x25;
-// const GET_LBA_SATUS: u8 = 0x9e;
-// const REPORT_SUPPORTED_OPERATIONS_CODES: u8 = 0xa3;
+// 0x9e is read capacity(16) or other command.
+const REPORT_PREFIX: u8 = 0xa3;
 
 fn do_cmd(p: *mut u8) {
     let mb: &mut tcmu::tcmu_mailbox =
@@ -249,8 +305,9 @@ fn do_cmd(p: *mut u8) {
                 let status = match command {
                     INQUIRY => handle_inquiry(cdb_p, p, ent),
                     TEST_UNIT_READY => handle_test_unit_ready(),
-                    MODE_SENSE_6 => handle_mode_sense_6(cdb_p, ent),
+                    MODE_SENSE_6 => handle_mode_sense_6(cdb_p, ent, p),
                     READ_CAPACITY_10 => handle_read_capacity_10(ent, p),
+                    REPORT_PREFIX => handle_report(cdb_p, ent, p),
                     _ => {
                         not_handled(ent);
                         CHECK_CONDITION
