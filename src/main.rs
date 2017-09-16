@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Result};
 use std::os::unix::io::AsRawFd;
 use std::ptr;
-use std::mem::{transmute, zeroed};
+use std::mem::{transmute, zeroed, uninitialized};
 use std::slice;
 use std::usize;
 use std::vec::Vec;
@@ -36,11 +36,16 @@ fn get_mmap_size() -> usize {
 }
 
 fn handle(storage: &mut [u8], uio: &mut File, p: *mut u8) {
+    let mb: &mut tcmu::tcmu_mailbox =
+        unsafe { transmute::<_, *mut tcmu::tcmu_mailbox>(p).as_mut().unwrap() };
+    let cmdr_off = unsafe { ptr::read_volatile(&mb.cmdr_off) };
+    let cmdr_size = unsafe { ptr::read_volatile(&mb.cmdr_size) };
+
     let mut poller = Poller::new();
     poller.register(uio.as_raw_fd());
     let mut n_empty_loop = 0;
     loop {
-        if do_cmd(storage, p) > 0 {
+        if do_cmd(storage, p, mb, cmdr_size, cmdr_off) > 0 {
             uio.write(&[0u8; 4]).unwrap();
             n_empty_loop = 0;
         } else {
@@ -169,15 +174,17 @@ fn handle_inquiry_std(ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) {
     DataBuffer::new(ent, base).write(&buf).unwrap();
 }
 
-unsafe fn into_cdb<'a>(p: *const u8) -> &'a [u8] {
-    let len = match (*p >> 5) & 7 {
+unsafe fn load_cdb(p: *const u8) -> [u8; 16] {
+    let mut s: [u8; 16] = uninitialized();
+    let l = match (*p >> 5) & 7 {
         0b000 => 6,
         0b001 | 0b010 => 10,
         0b100 => 16,
         0b101 => 12,
         _ => unimplemented!(),
     };
-    slice::from_raw_parts(p, len)
+    &mut s[..l].copy_from_slice(slice::from_raw_parts(p, l));
+    s
 }
 
 fn handle_inquiry(cdb: &[u8], base: *mut u8, ent: &mut tcmu::tcmu_cmd_entry) -> u8 {
@@ -357,68 +364,78 @@ const REPORT_PREFIX: u8 = 0xa3;
 
 const SYNCHRONIZE_CACHE_10: u8 = 0x35;
 
-fn do_cmd(storage: &mut [u8], p: *mut u8) -> usize {
-    let mb: &mut tcmu::tcmu_mailbox =
-        unsafe { transmute::<_, *mut tcmu::tcmu_mailbox>(p).as_mut().unwrap() };
+fn do_cmd(
+    storage: &mut [u8],
+    p: *mut u8,
+    mb: &mut tcmu::tcmu_mailbox,
+    cmdr_size: u32,
+    cmdr_off: u32,
+) -> usize {
     // todo?: use Atomic to load cmd_head
-    let head = unsafe { ptr::read_volatile(&mb.cmd_head) };
-    let head_p = unsafe { p.offset((mb.cmdr_off + head) as isize) };
-    let mut ent_p = unsafe { p.offset((mb.cmdr_off + mb.cmd_tail) as isize) };
-    #[cfg(debug)]
-    print!("cmd_head {}\n", head);
-    #[cfg(debug)]
-    print!("cmd_tail {}\n", mb.cmd_tail);
+    let cmd_head = unsafe { ptr::read_volatile(&mb.cmd_head) };
+    let mut cmd_tail = unsafe { ptr::read_volatile(&mb.cmd_tail) };
+    let head_p = unsafe { p.offset((cmdr_off + cmd_head) as isize) };
+    let mut ent_p = unsafe { p.offset((cmdr_off + cmd_tail) as isize) };
+    #[cfg(debug_assertions)]
+    print!("cmd_head {}\n", cmd_head);
+    #[cfg(debug_assertions)]
+    print!("cmd_tail {}\n", cmd_tail);
     let mut n_proceeded = 0;
     while ent_p != head_p {
         let ent = unsafe { (ent_p as *mut tcmu::tcmu_cmd_entry).as_mut().unwrap() };
-        let op = tcmu::tcmu_hdr_get_op(ent.hdr.len_op);
-        #[cfg(debug)]
+        let mut local_ent = unsafe { ptr::read_volatile(ent) };
+        let local_ent_p = &mut local_ent;
+        let op = tcmu::tcmu_hdr_get_op(local_ent_p.hdr.len_op);
+        #[cfg(debug_assertions)]
         print!(
             "op: {} id: {} k: {} u: {}\n",
             op,
-            ent.hdr.cmd_id,
-            ent.hdr.kflags,
-            ent.hdr.uflags
+            local_ent_p.hdr.cmd_id,
+            local_ent_p.hdr.kflags,
+            local_ent_p.hdr.uflags
         );
         if op == tcmu::tcmu_opcode::TCMU_OP_CMD as u32 {
             unsafe {
-                let cdb_p = p.offset(ent.__bindgen_anon_1.req.as_ref().cdb_off as isize);
-                let cdb = into_cdb(cdb_p);
+                let cdb_p = p.offset(local_ent_p.__bindgen_anon_1.req.as_ref().cdb_off as isize);
+                let cdb = &load_cdb(cdb_p);
                 let command = cdb[0];
                 let status = match command {
-                    INQUIRY => handle_inquiry(cdb, p, ent),
+                    INQUIRY => handle_inquiry(cdb, p, local_ent_p),
                     TEST_UNIT_READY => handle_test_unit_ready(),
-                    MODE_SENSE_6 => handle_mode_sense_6(cdb, ent, p),
-                    READ_CAPACITY_10 => handle_read_capacity_10(ent, p),
-                    REPORT_PREFIX => handle_report(cdb, ent, p),
-                    READ_10 | WRITE_10 => handle_read_write_10(storage, cdb, ent, p),
+                    MODE_SENSE_6 => handle_mode_sense_6(cdb, local_ent_p, p),
+                    READ_CAPACITY_10 => handle_read_capacity_10(local_ent_p, p),
+                    REPORT_PREFIX => handle_report(cdb, local_ent_p, p),
+                    READ_10 | WRITE_10 => handle_read_write_10(storage, cdb, local_ent_p, p),
                     SYNCHRONIZE_CACHE_10 => {
                         //todo
                         NO_SENSE
                     }
                     _ => {
                         print!("Unsupported SCSI opcode: 0x{:x}\n", command);
-                        not_handled(ent);
+                        not_handled(local_ent_p);
                         CHECK_CONDITION
                     }
                 };
-                ent.__bindgen_anon_1.rsp.as_mut().scsi_status = status;
+                if status == NO_SENSE {
+                    ptr::write_volatile(&mut ent.__bindgen_anon_1.rsp.as_mut().scsi_status, status);
+                } else {
+                    local_ent_p.__bindgen_anon_1.rsp.as_mut().scsi_status = status;
+                    ptr::write_volatile(ent, *local_ent_p);
+                }
             }
         } else if op == tcmu::tcmu_opcode::TCMU_OP_PAD as u32 {
             // do nothing
         } else {
             panic!("unknown cmd: {}", op);
         }
-        unsafe {
-            ptr::write_volatile(
-                &mut mb.cmd_tail,
-                (mb.cmd_tail + tcmu::tcmu_hdr_get_len(ent.hdr.len_op)) % mb.cmdr_size,
-            )
-        };
-        #[cfg(debug)]
-        print!("cmd_tail {}\n", mb.cmd_tail);
-        ent_p = unsafe { p.offset((mb.cmdr_off + mb.cmd_tail) as isize) };
+        cmd_tail = (cmd_tail + tcmu::tcmu_hdr_get_len(local_ent_p.hdr.len_op)) % cmdr_size;
+        #[cfg(debug_assertions)]
+        print!("cmd_tail {}\n", cmd_tail);
+        ent_p = unsafe { p.offset((cmdr_off + cmd_tail) as isize) };
         n_proceeded += 1;
+    }
+    unsafe {
+        ptr::write_volatile(&mut mb.cmd_tail, cmd_tail);
     }
     n_proceeded
 }
