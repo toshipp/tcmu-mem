@@ -38,16 +38,17 @@ fn get_mmap_size() -> usize {
 fn handle(storage: &mut [u8], uio: &mut File, p: *mut u8) {
     let mut poller = Poller::new();
     poller.register(uio.as_raw_fd());
+    let mut n_empty_loop = 0;
     loop {
-        #[cfg(debug)]
-        print!("begin\n");
-        poller.wait();
-        do_cmd(storage, p);
-        let dummy = 0u32;
-        uio.write(&unsafe { transmute::<_, [u8; 4]>(dummy) })
-            .unwrap();
-        #[cfg(debug)]
-        print!("done\n");
+        if do_cmd(storage, p) > 0 {
+            uio.write(&[0u8; 4]).unwrap();
+            n_empty_loop = 0;
+        } else {
+            n_empty_loop += 1;
+            if n_empty_loop > 100 {
+                poller.wait();
+            }
+        }
     }
 }
 
@@ -356,24 +357,19 @@ const REPORT_PREFIX: u8 = 0xa3;
 
 const SYNCHRONIZE_CACHE_10: u8 = 0x35;
 
-fn do_cmd(storage: &mut [u8], p: *mut u8) {
+fn do_cmd(storage: &mut [u8], p: *mut u8) -> usize {
     let mb: &mut tcmu::tcmu_mailbox =
         unsafe { transmute::<_, *mut tcmu::tcmu_mailbox>(p).as_mut().unwrap() };
-    #[cfg(debug)]
-    unsafe {
-        print!(
-            "mb {}, tail {}\n",
-            transmute::<_, u64>(p),
-            transmute::<_, u64>(&mut mb.cmd_tail)
-        );
-    }
+    // todo?: use Atomic to load cmd_head
+    let head = unsafe { ptr::read_volatile(&mb.cmd_head) };
+    let head_p = unsafe { p.offset((mb.cmdr_off + head) as isize) };
     let mut ent_p = unsafe { p.offset((mb.cmdr_off + mb.cmd_tail) as isize) };
-    // todo: use Atomic to load cmd_head
     #[cfg(debug)]
-    print!("cmd_head {}\n", mb.cmd_head);
+    print!("cmd_head {}\n", head);
     #[cfg(debug)]
     print!("cmd_tail {}\n", mb.cmd_tail);
-    while ent_p != unsafe { p.offset((mb.cmdr_off + mb.cmd_head) as isize) } {
+    let mut n_proceeded = 0;
+    while ent_p != head_p {
         let ent = unsafe { (ent_p as *mut tcmu::tcmu_cmd_entry).as_mut().unwrap() };
         let op = tcmu::tcmu_hdr_get_op(ent.hdr.len_op);
         #[cfg(debug)]
@@ -422,8 +418,11 @@ fn do_cmd(storage: &mut [u8], p: *mut u8) {
         #[cfg(debug)]
         print!("cmd_tail {}\n", mb.cmd_tail);
         ent_p = unsafe { p.offset((mb.cmdr_off + mb.cmd_tail) as isize) };
+        n_proceeded += 1;
     }
+    n_proceeded
 }
+
 
 struct Poller {
     eventfd: libc::c_int,
