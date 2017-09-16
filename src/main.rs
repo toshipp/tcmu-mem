@@ -1,13 +1,13 @@
 extern crate libc;
-extern crate byteorder;
-use byteorder::{ByteOrder, BigEndian};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Result};
 use std::os::unix::io::AsRawFd;
 use std::ptr;
-use std::mem::transmute;
+use std::mem::{transmute, zeroed};
 use std::slice;
 use std::usize;
+use std::vec::Vec;
+use std::cell::RefCell;
 mod tcmu;
 
 
@@ -35,14 +35,18 @@ fn get_mmap_size() -> usize {
     usize::from_str_radix(&s[2..s.len() - 1], 16).unwrap()
 }
 
-fn handle(uio: &mut File, p: *mut u8) {
+fn handle(storage: &mut [u8], uio: &mut File, p: *mut u8) {
+    let mut poller = Poller::new();
+    poller.register(uio.as_raw_fd());
     loop {
+        #[cfg(debug)]
         print!("begin\n");
-        let mut dummy: [u8; 4] = [0, 0, 0, 0];
-        uio.read(&mut dummy).unwrap();
-        do_cmd(p);
-        dummy = [0, 0, 0, 0];
-        uio.write(&dummy).unwrap();
+        poller.wait();
+        do_cmd(storage, p);
+        let dummy = 0u32;
+        uio.write(&unsafe { transmute::<_, [u8; 4]>(dummy) })
+            .unwrap();
+        #[cfg(debug)]
         print!("done\n");
     }
 }
@@ -73,22 +77,22 @@ fn sense(ent: &mut tcmu::tcmu_cmd_entry, sense_key: u8) {
 
 }
 
-struct Responder<'a> {
+struct DataBuffer<'a> {
     base: *mut u8,
     iov: &'a [tcmu::iovec],
     i: usize,
     pos: usize,
 }
 
-impl<'a> Responder<'a> {
-    fn new(ent: &'a tcmu::tcmu_cmd_entry, base: *mut u8) -> Responder<'a> {
+impl<'a> DataBuffer<'a> {
+    fn new(ent: &'a tcmu::tcmu_cmd_entry, base: *mut u8) -> DataBuffer<'a> {
         let iov_cnt = unsafe { ent.__bindgen_anon_1.req.as_ref().iov_cnt as usize };
         let iov = unsafe {
             ent.__bindgen_anon_1.req.as_ref().iov.as_slice(
                 iov_cnt as usize,
             )
         };
-        Responder {
+        DataBuffer {
             base: base,
             iov: iov,
             i: 0,
@@ -120,6 +124,30 @@ impl<'a> Responder<'a> {
         }
         Ok(n)
     }
+
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let mut n = 0;
+        while n < buf.len() && self.i < self.iov.len() {
+            let iob = unsafe {
+                &slice::from_raw_parts(
+                    self.base.offset(self.iov[self.i].iov_base as isize),
+                    self.iov[self.i].iov_len as usize,
+                )
+                    [self.pos..]
+            };
+            let l = if buf.len() - n >= iob.len() {
+                self.pos = 0;
+                self.i += 1;
+                iob.len()
+            } else {
+                self.pos += buf.len() - n;
+                buf.len() - n
+            };
+            &mut buf[n..n + l].copy_from_slice(&iob[..l]);
+            n += l;
+        }
+        Ok(n)
+    }
 }
 
 fn handle_inquiry_std(ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) {
@@ -137,18 +165,21 @@ fn handle_inquiry_std(ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) {
     for (s, d) in "0001".bytes().zip(&mut buf[32..]) {
         *d = s;
     }
-    let _ = Responder::new(ent, base).write(&buf);
+    DataBuffer::new(ent, base).write(&buf).unwrap();
 }
 
-unsafe fn into_cdb6<'a>(p: *const u8) -> &'a [u8] {
-    slice::from_raw_parts(p, 6)
-}
-unsafe fn into_cdb10<'a>(p: *const u8) -> &'a [u8] {
-    slice::from_raw_parts(p, 10)
+unsafe fn into_cdb<'a>(p: *const u8) -> &'a [u8] {
+    let len = match (*p >> 5) & 7 {
+        0b000 => 6,
+        0b001 | 0b010 => 10,
+        0b100 => 16,
+        0b101 => 12,
+        _ => unimplemented!(),
+    };
+    slice::from_raw_parts(p, len)
 }
 
-fn handle_inquiry(cdb_p: *const u8, base: *mut u8, ent: &mut tcmu::tcmu_cmd_entry) -> u8 {
-    let cdb = unsafe { into_cdb6(cdb_p) };
+fn handle_inquiry(cdb: &[u8], base: *mut u8, ent: &mut tcmu::tcmu_cmd_entry) -> u8 {
     let evpd = cdb[1] & 1 > 0;
     if !evpd {
         if cdb[2] != 0 {
@@ -178,13 +209,11 @@ struct mode_parameter_header {
     block_description_length: u8,
 }
 
-fn handle_mode_sense_6(cdb_p: *mut u8, ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) -> u8 {
-    let cdb = unsafe { into_cdb6(cdb_p) };
+fn handle_mode_sense_6(cdb: &[u8], ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) -> u8 {
     let dbd = cdb[1] & (1 << 3) > 0;
     let pc = cdb[2] >> 6;
     let page_code = cdb[2] & 0x3f;
     let subpage_code = cdb[3];
-    let allocation_length = cdb[4];
 
     print!(
         "mode sense6: dbd {}, pc {}, page code {}, sub {}\n",
@@ -203,8 +232,8 @@ fn handle_mode_sense_6(cdb_p: *mut u8, ent: &mut tcmu::tcmu_cmd_entry, base: *mu
                 wp_dpofua: 1 << 4, //dpofua is 1, wp is 0
                 block_description_length: 0,
             };
-            let mut r = Responder::new(ent, base);
-            r.write(unsafe { transmute::<_, &[u8; 4]>(&header) })
+            let mut b = DataBuffer::new(ent, base);
+            b.write(unsafe { transmute::<_, &[u8; 4]>(&header) })
                 .unwrap();
             NO_SENSE
         }
@@ -215,14 +244,14 @@ fn handle_mode_sense_6(cdb_p: *mut u8, ent: &mut tcmu::tcmu_cmd_entry, base: *mu
                 wp_dpofua: 1 << 4, //dpofua is 1, wp is 0
                 block_description_length: 0,
             };
-            let mut r = Responder::new(ent, base);
-            r.write(unsafe { transmute::<_, &[u8; 4]>(&header) })
+            let mut b= DataBuffer::new(ent, base);
+            b.write(unsafe { transmute::<_, &[u8; 4]>(&header) })
                 .unwrap();
             let mut cache_page = [0u8; 20];
             cache_page[0] = 0x8;
             cache_page[1] = 0x12;
             cache_page[2] = 1 << 2; //WCE, RCD
-            r.write(&cache_page).unwrap();
+            b.write(&cache_page).unwrap();
             NO_SENSE
         }
 
@@ -239,32 +268,84 @@ const DEVICE_SIZE: usize = 1 * 1024 * 1024 * 1024;
 const BLOCK_SIZE: usize = 4096;
 
 fn handle_read_capacity_10(ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) -> u8 {
-    let mut lba = [0; 4];
-    BigEndian::write_u32(&mut lba, (DEVICE_SIZE / BLOCK_SIZE) as u32);
-    let mut block_size = [0; 4];
-    BigEndian::write_u32(&mut block_size, BLOCK_SIZE as u32);
-    let mut r = Responder::new(ent, base);
-    let _ = r.write(&lba);
-    let _ = r.write(&block_size);
+    let lba = ((DEVICE_SIZE / BLOCK_SIZE - 1) as u32).to_be();
+    let block_size = (BLOCK_SIZE as u32).to_be();
+    let mut b = DataBuffer::new(ent, base);
+    b.write(&unsafe { transmute::<_, [u8; 4]>(lba) }).unwrap();
+    b.write(&unsafe { transmute::<_, [u8; 4]>(block_size) })
+        .unwrap();
 
     NO_SENSE
 }
 
-fn handle_report(cdb_p: *mut u8, ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) -> u8 {
-    let cdb = unsafe { into_cdb6(cdb_p) };
+fn handle_report_supported_operation_codes(
+    cdb: &[u8],
+    ent: &mut tcmu::tcmu_cmd_entry,
+    base: *mut u8,
+) -> u8 {
+    let requested_operation_code = cdb[3];
+    if cdb[2] == 1 {
+        // RCTD is 0 and reporting options is 1
+        let mut b = DataBuffer::new(ent, base);
+        // partial impl. CDB usage data is omitted.
+        let mut buf = [0u8; 2];
+        match requested_operation_code {
+            INQUIRY | TEST_UNIT_READY | MODE_SENSE_6 | READ_CAPACITY_10 | REPORT_PREFIX |
+            READ_10 | WRITE_10 => {
+                buf[1] = 3;
+            }
+            _ => {
+                print!("requested op code: {:x}\n", requested_operation_code);
+                // not supported
+                buf[1] = 1;
+            }
+        }
+        b.write(&buf).unwrap();
+        NO_SENSE
+    } else {
+        not_handled(ent);
+        CHECK_CONDITION
+    }
+}
+
+fn handle_report(cdb: &[u8], ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) -> u8 {
     let service_action = cdb[1] & 0x1f;
     match service_action {
-        0xc => {
-            // report supported operation codes
-            not_handled(ent);
-            CHECK_CONDITION
-        }
+        0xc => handle_report_supported_operation_codes(cdb, ent, base),
         _ => {
             not_handled(ent);
             CHECK_CONDITION
         }
     }
 }
+
+fn handle_read_write_10(
+    storage: &mut [u8],
+    cdb: &[u8],
+    ent: &mut tcmu::tcmu_cmd_entry,
+    base: *mut u8,
+) -> u8 {
+    let _protect = cdb[1] >> 5;
+    let _dpo = (cdb[1] >> 4) & 1;
+    let _fua = (cdb[1] >> 3) & 1;
+    let _rarc = (cdb[1] >> 2) & 1;
+    let lba = unsafe { u32::from_be(*transmute::<_, *const u32>(&cdb[2])) };
+    let transfer_length = unsafe { u16::from_be(*transmute::<_, *const u16>(&cdb[7])) };
+
+    let begin = BLOCK_SIZE * (lba as usize);
+    let end = begin + BLOCK_SIZE * (transfer_length as usize);
+    let mut b = DataBuffer::new(ent, base);
+    if cdb[0] == READ_10 {
+        b.write(&storage[begin..end]).unwrap();
+    } else {
+        b.read(&mut storage[begin..end]).unwrap();
+    }
+
+    NO_SENSE
+}
+
+const READ_10: u8 = 0x28;
+const WRITE_10: u8 = 0x2a;
 
 const INQUIRY: u8 = 0x12;
 const TEST_UNIT_READY: u8 = 0x00;
@@ -273,9 +354,12 @@ const READ_CAPACITY_10: u8 = 0x25;
 // 0x9e is read capacity(16) or other command.
 const REPORT_PREFIX: u8 = 0xa3;
 
-fn do_cmd(p: *mut u8) {
+const SYNCHRONIZE_CACHE_10: u8 = 0x35;
+
+fn do_cmd(storage: &mut [u8], p: *mut u8) {
     let mb: &mut tcmu::tcmu_mailbox =
         unsafe { transmute::<_, *mut tcmu::tcmu_mailbox>(p).as_mut().unwrap() };
+    #[cfg(debug)]
     unsafe {
         print!(
             "mb {}, tail {}\n",
@@ -285,11 +369,14 @@ fn do_cmd(p: *mut u8) {
     }
     let mut ent_p = unsafe { p.offset((mb.cmdr_off + mb.cmd_tail) as isize) };
     // todo: use Atomic to load cmd_head
+    #[cfg(debug)]
     print!("cmd_head {}\n", mb.cmd_head);
+    #[cfg(debug)]
     print!("cmd_tail {}\n", mb.cmd_tail);
     while ent_p != unsafe { p.offset((mb.cmdr_off + mb.cmd_head) as isize) } {
         let ent = unsafe { (ent_p as *mut tcmu::tcmu_cmd_entry).as_mut().unwrap() };
         let op = tcmu::tcmu_hdr_get_op(ent.hdr.len_op);
+        #[cfg(debug)]
         print!(
             "op: {} id: {} k: {} u: {}\n",
             op,
@@ -300,15 +387,21 @@ fn do_cmd(p: *mut u8) {
         if op == tcmu::tcmu_opcode::TCMU_OP_CMD as u32 {
             unsafe {
                 let cdb_p = p.offset(ent.__bindgen_anon_1.req.as_ref().cdb_off as isize);
-                let command = *cdb_p.as_ref().unwrap();
-                print!("SCSI opcode: 0x{:x}\n", command);
+                let cdb = into_cdb(cdb_p);
+                let command = cdb[0];
                 let status = match command {
-                    INQUIRY => handle_inquiry(cdb_p, p, ent),
+                    INQUIRY => handle_inquiry(cdb, p, ent),
                     TEST_UNIT_READY => handle_test_unit_ready(),
-                    MODE_SENSE_6 => handle_mode_sense_6(cdb_p, ent, p),
+                    MODE_SENSE_6 => handle_mode_sense_6(cdb, ent, p),
                     READ_CAPACITY_10 => handle_read_capacity_10(ent, p),
-                    REPORT_PREFIX => handle_report(cdb_p, ent, p),
+                    REPORT_PREFIX => handle_report(cdb, ent, p),
+                    READ_10 | WRITE_10 => handle_read_write_10(storage, cdb, ent, p),
+                    SYNCHRONIZE_CACHE_10 => {
+                        //todo
+                        NO_SENSE
+                    }
                     _ => {
+                        print!("Unsupported SCSI opcode: 0x{:x}\n", command);
                         not_handled(ent);
                         CHECK_CONDITION
                     }
@@ -326,8 +419,64 @@ fn do_cmd(p: *mut u8) {
                 (mb.cmd_tail + tcmu::tcmu_hdr_get_len(ent.hdr.len_op)) % mb.cmdr_size,
             )
         };
+        #[cfg(debug)]
         print!("cmd_tail {}\n", mb.cmd_tail);
         ent_p = unsafe { p.offset((mb.cmdr_off + mb.cmd_tail) as isize) };
+    }
+}
+
+struct Poller {
+    eventfd: libc::c_int,
+    events: RefCell<Vec<libc::epoll_event>>,
+}
+
+impl Poller {
+    fn new() -> Poller {
+        unsafe {
+            let fd = libc::epoll_create(1 /*dummy*/);
+            if fd == -1 {
+                panic!("epoll_create failed");
+            }
+            Poller {
+                eventfd: fd,
+                events: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    fn register(&mut self, fd: libc::c_int) {
+        let mut ev = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLET) as u32,
+            u64: fd as u64,
+        };
+        unsafe {
+            if libc::epoll_ctl(self.eventfd, libc::EPOLL_CTL_ADD, fd, &mut ev) == -1 {
+                panic!("epoll_ctl failed");
+            }
+        }
+        let events = self.events.get_mut();
+        let n = events.len() + 1;
+        events.resize(n, unsafe { zeroed() });
+    }
+
+    fn wait(&self) {
+        let mut events = self.events.borrow_mut();
+        unsafe {
+            libc::epoll_wait(
+                self.eventfd,
+                events.as_mut_slice().as_mut_ptr(),
+                events.len() as i32,
+                -1,
+            );
+        }
+    }
+}
+
+impl Drop for Poller {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.eventfd);
+        }
     }
 }
 
@@ -352,5 +501,9 @@ fn main() {
         p as *mut u8
     };
 
-    handle(&mut uio, p);
+    let mut storage = Vec::with_capacity(DEVICE_SIZE);
+    unsafe {
+        storage.set_len(DEVICE_SIZE);
+    }
+    handle(&mut storage[..], &mut uio, p);
 }
