@@ -74,6 +74,7 @@ fn handle(storage: &mut [u8], uio: &mut File, p: *mut u8) {
         } else {
             n_empty_loop += 1;
             if n_empty_loop > 100 {
+                n_empty_loop = 0;
                 poller.wait();
             }
         }
