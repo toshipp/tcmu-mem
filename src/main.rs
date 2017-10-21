@@ -1,13 +1,15 @@
 extern crate libc;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Result};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::ptr;
-use std::mem::{transmute, zeroed, uninitialized};
+use std::mem::{transmute, zeroed, uninitialized, drop};
 use std::slice;
 use std::usize;
 use std::vec::Vec;
 use std::cell::RefCell;
+use std::thread;
+use std::sync::{Mutex, Arc, Condvar};
 mod tcmu;
 
 
@@ -41,12 +43,33 @@ fn handle(storage: &mut [u8], uio: &mut File, p: *mut u8) {
     let cmdr_off = unsafe { ptr::read_volatile(&mb.cmdr_off) };
     let cmdr_size = unsafe { ptr::read_volatile(&mb.cmdr_size) };
 
+    let notify = Arc::new((Mutex::new(false), Condvar::new()));
+    let notify2 = notify.clone();
+    let mut uio2 = unsafe { File::from_raw_fd(uio.as_raw_fd()) }; //uio.try_clone().unwrap();
+    thread::spawn(move || {
+        let &(ref lock, ref cv) = &*notify2;
+        let mut notified = lock.lock().unwrap();
+        loop {
+            if *notified {
+                *notified = false;
+                // unlock before write because the invocation takes some time.
+                drop(notified);
+                uio2.write(&[0u8; 4]).unwrap();
+                notified = lock.lock().unwrap();
+                continue;
+            }
+            notified = cv.wait(notified).unwrap();
+        }
+    });
+
     let mut poller = Poller::new();
     poller.register(uio.as_raw_fd());
     let mut n_empty_loop = 0;
+    let &(ref lock, ref cv) = &*notify;
     loop {
         if do_cmd(storage, p, mb, cmdr_size, cmdr_off) > 0 {
-            uio.write(&[0u8; 4]).unwrap();
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
             n_empty_loop = 0;
         } else {
             n_empty_loop += 1;
