@@ -272,12 +272,16 @@ fn handle_mode_sense_6(cdb: &[u8], ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8
 
 }
 
-const DEVICE_SIZE: usize = 1 * 1024 * 1024 * 1024;
+const LBA: usize = 0xffffffff_fffffffe;
 // In sd.c, 512, 1024, 2048, 4096 are only supported.
 const BLOCK_SIZE: usize = 4096;
 
 fn handle_read_capacity_10(ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) -> u8 {
-    let lba = ((DEVICE_SIZE / BLOCK_SIZE - 1) as u32).to_be();
+    let lba = if LBA > 0xffffffff {
+        0xffffffff
+    } else {
+        (LBA as u32).to_be()
+    };
     let block_size = (BLOCK_SIZE as u32).to_be();
     let mut b = DataBuffer::new(ent, base);
     b.write(&unsafe { transmute::<_, [u8; 4]>(lba) }).unwrap();
@@ -299,8 +303,16 @@ fn handle_report_supported_operation_codes(
         // partial impl. CDB usage data is omitted.
         let mut buf = [0u8; 2];
         match requested_operation_code {
-            INQUIRY | TEST_UNIT_READY | MODE_SENSE_6 | READ_CAPACITY_10 | REPORT_PREFIX |
-            READ_10 | WRITE_10 => {
+            INQUIRY |
+            TEST_UNIT_READY |
+            MODE_SENSE_6 |
+            READ_CAPACITY_10 |
+            REPORT_OPERATION |
+            SERVICE_ACTION_IN_16 |
+            READ_10 |
+            WRITE_10 |
+            READ_16 |
+            WRITE_16 => {
                 buf[1] = 3;
             }
             _ => {
@@ -328,7 +340,32 @@ fn handle_report(cdb: &[u8], ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) -> u
     }
 }
 
-fn handle_read_write_10(
+fn handle_read_capacity_16(cdb: &[u8], ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) -> u8 {
+    let lba = (LBA as u64).to_be();
+    let block_size = (BLOCK_SIZE as u32).to_be();
+    let mut b = DataBuffer::new(ent, base);
+    b.write(&unsafe { transmute::<_, [u8; 8]>(lba) }).unwrap();
+    b.write(&unsafe { transmute::<_, [u8; 4]>(block_size) })
+        .unwrap();
+    let mut buf = [0u8; 32];
+    buf[0] = 1 << 4; // rc basis. no zone (?)
+    b.write(&buf).unwrap();
+    NO_SENSE
+}
+
+fn handle_service_action_16(cdb: &[u8], ent: &mut tcmu::tcmu_cmd_entry, base: *mut u8) -> u8 {
+    let service_action = cdb[1] & 0x1f;
+    match service_action {
+        0x10 => handle_read_capacity_16(cdb, ent, base),
+        _ => {
+            not_handled(ent);
+            CHECK_CONDITION
+        }
+    }
+}
+
+
+fn handle_read_write_1x(
     storage: &mut [u8],
     cdb: &[u8],
     ent: &mut tcmu::tcmu_cmd_entry,
@@ -338,30 +375,50 @@ fn handle_read_write_10(
     let _dpo = (cdb[1] >> 4) & 1;
     let _fua = (cdb[1] >> 3) & 1;
     let _rarc = (cdb[1] >> 2) & 1;
-    let lba = unsafe { u32::from_be(*transmute::<_, *const u32>(&cdb[2])) };
-    let transfer_length = unsafe { u16::from_be(*transmute::<_, *const u16>(&cdb[7])) };
+    let lba = match cdb[0] {
+        READ_10 | WRITE_10 => unsafe {
+            u32::from_be(*transmute::<_, *const u32>(&cdb[2])) as usize
+        },
+        READ_16 | WRITE_16 => unsafe {
+            u64::from_be(*transmute::<_, *const u64>(&cdb[2])) as usize
+        },
+        _ => unreachable!(),
+    };
+    let transfer_length = match cdb[0] {
+        READ_10 | WRITE_10 => unsafe {
+            u16::from_be(*transmute::<_, *const u16>(&cdb[7])) as usize
+        },
+        READ_16 | WRITE_16 => unsafe {
+            u32::from_be(*transmute::<_, *const u32>(&cdb[10])) as usize
+        },
+        _ => unreachable!(),
+    };
 
-    let begin = BLOCK_SIZE * (lba as usize);
-    let end = begin + BLOCK_SIZE * (transfer_length as usize);
+    let begin = BLOCK_SIZE * lba;
+    let end = begin + BLOCK_SIZE * transfer_length;
     let mut b = DataBuffer::new(ent, base);
-    if cdb[0] == READ_10 {
-        b.write(&storage[begin..end]).unwrap();
-    } else {
-        b.read(&mut storage[begin..end]).unwrap();
-    }
+    match cdb[0] {
+        READ_10 | READ_16 => // b.write(&storage[begin..end]).unwrap()
+        {},
+        WRITE_10 | WRITE_16 => // b.read(&mut storage[begin..end]).unwrap()
+        {}  ,
+        _ => unreachable!(),
+    };
 
     NO_SENSE
 }
 
 const READ_10: u8 = 0x28;
 const WRITE_10: u8 = 0x2a;
+const READ_16: u8 = 0x88;
+const WRITE_16: u8 = 0x8a;
 
 const INQUIRY: u8 = 0x12;
 const TEST_UNIT_READY: u8 = 0x00;
 const MODE_SENSE_6: u8 = 0x1a;
 const READ_CAPACITY_10: u8 = 0x25;
-// 0x9e is read capacity(16) or other command.
-const REPORT_PREFIX: u8 = 0xa3;
+const SERVICE_ACTION_IN_16: u8 = 0x9e;
+const REPORT_OPERATION: u8 = 0xa3;
 
 const SYNCHRONIZE_CACHE_10: u8 = 0x35;
 
@@ -405,8 +462,11 @@ fn do_cmd(
                     TEST_UNIT_READY => handle_test_unit_ready(),
                     MODE_SENSE_6 => handle_mode_sense_6(cdb, local_ent_p, p),
                     READ_CAPACITY_10 => handle_read_capacity_10(local_ent_p, p),
-                    REPORT_PREFIX => handle_report(cdb, local_ent_p, p),
-                    READ_10 | WRITE_10 => handle_read_write_10(storage, cdb, local_ent_p, p),
+                    REPORT_OPERATION => handle_report(cdb, local_ent_p, p),
+                    READ_10 | WRITE_10 | READ_16 | WRITE_16 => {
+                        handle_read_write_1x(storage, cdb, local_ent_p, p)
+                    }
+                    SERVICE_ACTION_IN_16 => handle_service_action_16(cdb, local_ent_p, p),
                     SYNCHRONIZE_CACHE_10 => {
                         //todo
                         NO_SENSE
@@ -518,9 +578,10 @@ fn main() {
         p as *mut u8
     };
 
-    let mut storage = Vec::with_capacity(DEVICE_SIZE);
-    unsafe {
-        storage.set_len(DEVICE_SIZE);
-    }
+    // let mut storage = Vec::with_capacity(DEVICE_SIZE);
+    // unsafe {
+    //     storage.set_len(DEVICE_SIZE);
+    // }
+    let mut storage = Vec::new();
     handle(&mut storage[..], &mut uio, p);
 }
